@@ -43,7 +43,7 @@ def hdu_to_imagemodel(in_hdu):
     
     # Initialize GWCS
     tform = gwcs.wcs.utils.make_fitswcs_transform(new_header)
-    hwcs = gwcs.WCS(forward_transform=tform, output_frame=ICRS())#gwcs.CelestialFrame())
+    hwcs = gwcs.WCS(forward_transform=tform, output_frame=gwcs.CelestialFrame())
     sh = hdu.data.shape
     hwcs.bounding_box = ((-0.5, sh[0]-0.5), (-0.5, sh[1]-0.5))
     
