@@ -252,10 +252,14 @@ def _compute_model(i, flt, fit_info, is_cgs, store):
                           spectrum_1d = fit_info[id]['spec'], is_cgs=is_cgs, 
                           verbose=False)
         except:
+            status = False
             print('Failed: {0} {1}'.format(flt.grism.parent_file, id))
             continue
-            
-    print('{0}: _compute_model Done'.format(flt.grism.parent_file))
+       
+    if status is True:
+        print('{0}: _compute_model Done'.format(flt.grism.parent_file))
+    else:
+        print('ERROR! {0}: _compute_model FAILED partially or completely'.format(flt.grism.parent_file))
         
     return i, flt.model, flt.object_dispersers
     
@@ -596,20 +600,26 @@ class GroupFLT():
                 fit_info[id] = {'mag':mag, 'spec': [xspec, yspec]}
             
             is_cgs = False
-            
+        
         t0_pool = time.time()
         
-        pool = mp.Pool(processes=cpu_count)
-        results = [pool.apply_async(_compute_model, (i, self.FLTs[i], fit_info, is_cgs, store)) for i in range(self.N)]
-
-        pool.close()
-        pool.join()
+        if cpu_count >= 0:
+            pool = mp.Pool(processes=cpu_count)
+            results = [pool.apply_async(_compute_model, (i, self.FLTs[i], fit_info, is_cgs, store)) for i in range(self.N)]
+    
+            pool.close()
+            pool.join()
+            for res in results:
+                i, model, dispersers = res.get(timeout=1)
+                self.FLTs[i].object_dispersers = dispersers
+                self.FLTs[i].model = model
+        else:
+            results = [_compute_model(i, self.FLTs[i], fit_info, is_cgs, store) for i in range(self.N)]
+            for res in results:
+                i, model, dispersers = res
+                self.FLTs[i].object_dispersers = dispersers
+                self.FLTs[i].model = model
                 
-        for res in results:
-            i, model, dispersers = res.get(timeout=1)
-            self.FLTs[i].object_dispersers = dispersers
-            self.FLTs[i].model = model
-            
         t1_pool = time.time()
         if verbose:
             print('Models computed - {0:.2f} sec.'.format(t1_pool - t0_pool))
