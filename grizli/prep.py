@@ -1657,7 +1657,7 @@ def get_sdss_catalog(ra=165.86, dec=34.829694, radius=3):
 def get_twomass_catalog(ra=165.86, dec=34.829694, radius=3, catalog='allwise_p3as_psd'):
     return get_irsa_catalog(ra=ra, dec=dec, radius=radius, catalog='fp_psc', wise=False, twomass=True)
 
-def get_irsa_catalog(ra=165.86, dec=34.829694, radius=3, catalog='allwise_p3as_psd', wise=False, twomass=False):
+def get_irsa_catalog(ra=165.86, dec=34.829694, tab=None, radius=3, catalog='allwise_p3as_psd', wise=False, twomass=False, ROW_LIMIT=500000, TIMEOUT=3600):
     """Query for objects in the `AllWISE <http://wise2.ipac.caltech.edu/docs/release/allwise/>`_ source catalog 
     
     Parameters
@@ -1675,7 +1675,8 @@ def get_irsa_catalog(ra=165.86, dec=34.829694, radius=3, catalog='allwise_p3as_p
         
     """
     from astroquery.irsa import Irsa
-    Irsa.ROW_LIMIT = 100000
+    Irsa.ROW_LIMIT = ROW_LIMIT
+    Irsa.TIMEOUT = TIMEOUT
     
     #all_wise = 'wise_allwise_p3as_psd'
     #all_wise = 'allwise_p3as_psd'
@@ -2144,8 +2145,11 @@ def process_direct_grism_visit(direct={}, grism={}, radec=None,
         for file in direct['files']:
             crclean = isACS & (len(direct['files']) == 1)
             fresh_flt_file(file, crclean=crclean)
-            updatewcs.updatewcs(file, verbose=False)
-    
+            try:
+                updatewcs.updatewcs(file, verbose=False, use_db=False)
+            except:
+                updatewcs.updatewcs(file, verbose=False)
+                
         # ### Make ASN
         # if not isWFPC2:
         #     asn = asnutil.ASNTable(inlist=direct['files'], output=direct['product'])
@@ -2174,8 +2178,11 @@ def process_direct_grism_visit(direct={}, grism={}, radec=None,
                 changed_filter = False
                      
             # Run updatewcs 
-            updatewcs.updatewcs(file, verbose=False)
-            
+            try:
+                updatewcs.updatewcs(file, verbose=False, use_db=False)
+            except:
+                updatewcs.updatewcs(file, verbose=False)
+                
             # Change back
             if changed_filter:
                 flc = pyfits.open(file, mode='update')
@@ -2978,7 +2985,10 @@ def match_direct_grism_wcs(direct={}, grism={}, get_fresh_flt=True,
     if get_fresh_flt:
         for file in grism['files']:
             fresh_flt_file(file)
-            updatewcs.updatewcs(file, verbose=False)
+            try:
+                updatewcs.updatewcs(file, verbose=False, use_db=False)
+            except:
+                updatewcs.updatewcs(file, verbose=False)
         
     direct_flt = pyfits.open(direct['files'][0])
     ref_catalog = direct_flt['SCI',1].header['WCSNAME']

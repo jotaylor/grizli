@@ -283,7 +283,7 @@ def parse_flt_files(files=[], info=None, uniquename=False, use_visit=False,
     info = info[so]
 
     #pa_v3 = np.round(info['pa_v3']*10)/10 % 360.
-    pa_v3 = np.round(info['pa_v3']) % 360.
+    pa_v3 = np.round(np.round(info['pa_v3'], decimals=1)) % 360.
     
     target_list = []
     for i in range(len(info)):
@@ -1052,7 +1052,7 @@ def get_line_wavelengths():
     return line_wavelengths, line_ratios 
     
 class SpectrumTemplate(object):
-    def __init__(self, wave=None, flux=None, central_wave=None, fwhm=None, velocity=False, fluxunits=FLAMBDA_CGS, waveunits=u.angstrom, name='', lorentz=False):
+    def __init__(self, wave=None, flux=None, central_wave=None, fwhm=None, velocity=False, fluxunits=FLAMBDA_CGS, waveunits=u.angstrom, name='', lorentz=False, err=None):
         """Container for template spectra.   
                 
         Parameters
@@ -1111,7 +1111,12 @@ class SpectrumTemplate(object):
         self.flux = flux
         if flux is not None:
             self.flux = np.cast[np.float](flux)
-
+        
+        if err is not None:
+            self.err = np.cast[np.float](err)
+        else:
+            self.err = None
+            
         self.fwhm = None
         self.velocity = None
         
@@ -1126,7 +1131,7 @@ class SpectrumTemplate(object):
             self.wave, self.flux = self.make_gaussian(central_wave, fwhm,
                                                       wave_grid=wave,
                                                       velocity=velocity,
-                                                      max_sigma=10,
+                                                      max_sigma=50,
                                                       lorentz=lorentz)
         
         self.fnu_units = FNU_CGS
@@ -1156,7 +1161,7 @@ class SpectrumTemplate(object):
             Clip values where the value of the gaussian function is less than 
             `clip` times its maximum (i.e., `1/sqrt(2*pi*sigma**2)`).
         
-        lorentz : book
+        lorentz : bool
             Make a Lorentzian line instead of a Gaussian.
             
         Returns
@@ -1180,6 +1185,8 @@ class SpectrumTemplate(object):
                 rms = fwhm/2.35
                 
         if wave_grid is None:
+            #print('xxx line', central_wave, max_sigma, rms)
+            
             wave_grid = np.arange(-max_sigma, max_sigma, step)*rms
             wave_grid += central_wave
             wave_grid = np.hstack([91., wave_grid, 1.e8])
@@ -1296,14 +1303,22 @@ class SpectrumTemplate(object):
             (self.fluxunits.__str__() == 'erg / (Angstrom cm2 s)')):
             # Faster
             flux_fnu = self.flux*self.wave**2/2.99792458e18*fnu_units
+            if self.err is not None:
+                err_fnu = self.err*self.wave**2/2.99792458e18*fnu_units
         else:
             # Use astropy conversion
             flux_fnu = (self.flux*self.fluxunits).to(fnu_units, equivalencies=u.spectral_density(self.wave*self.waveunits))
-        
+            if self.err is not None:
+                err_fnu = (self.err*self.fluxunits).to(fnu_units, equivalencies=u.spectral_density(self.wave*self.waveunits))
+                
         self.fnu_units = fnu_units
         self.flux_fnu = flux_fnu.value
-        
-    def integrate_filter(self, filter, abmag=False):
+        if self.err is not None:
+            self.err_fnu = err_fnu.value
+        else:
+            self.err_fnu = None
+            
+    def integrate_filter(self, filter, abmag=False, use_wave='filter'):
         """Integrate the template through an `~eazy.FilterDefinition` filter
         object.
         
@@ -1350,26 +1365,68 @@ class SpectrumTemplate(object):
             interp = np.interp
         
         #wz = self.wave*(1+z)
-        if (filter.wave.min() > self.wave.max()) | (filter.wave.max() < self.wave.min()) | (filter.wave.min() < self.wave.min()):
-            return 0.
+        nonzero = filter.throughput > 0
+        if (filter.wave[nonzero].min() > self.wave.max()) | (filter.wave[nonzero].max() < self.wave.min()) | (filter.wave[nonzero].min() < self.wave.min()):
+            if self.err is None:
+                return 0.
+            else:
+                return 0., 0.
                 
-        templ_filter = interp(filter.wave.astype(np.float), self.wave,
-                              self.flux_fnu)
-        
-        if hasattr(filter, 'norm'):
+        if use_wave == 'filter':
+            ### Interpolate to filter wavelengths
+            integrate_wave = filter.wave
+
+            integrate_templ = interp(filter.wave.astype(np.float), self.wave,
+                              self.flux_fnu, left=0, right=0)
+            
+            if self.err is not None:
+                templ_ivar = 1./interp(filter.wave.astype(np.float), 
+                                       self.wave, self.err_fnu)**2
+                                       
+                templ_ivar[~np.isfinite(templ_ivar)] = 0
+                                      
+                integrate_weight = filter.throughput/filter.wave*templ_ivar/filter.norm
+            else:
+                integrate_weight = filter.throughput/filter.wave
+        else:
+            ### Interpolate to spectrum wavelengths
+            integrate_wave = self.wave
+            integrate_templ = self.flux_fnu
+
+            # test = nonzero
+            test = np.isfinite(filter.throughput)
+            interp_thru = interp(integrate_wave, filter.wave[test],
+                                  filter.throughput[test], 
+                                  left=0, right=0)          
+                                                
+            if self.err is not None:
+                templ_ivar = 1/self.err_fnu**2
+                templ_ivar[~np.isfinite(templ_ivar)] = 0
+                
+                integrate_weight = interp_thru/integrate_wave*templ_ivar/filter.norm
+            else:
+                integrate_weight = interp_thru/integrate_wave#/templ_err**2
+                    
+        if hasattr(filter, 'norm') & (self.err is None):
             filter_norm = filter.norm
         else:
             # e.g., pysynphot bandpass
-            filter_norm = INTEGRATOR(filter.throughput/filter.wave,
-                                     filter.wave)
+            filter_norm = INTEGRATOR(integrate_weight, integrate_wave)
             
         # f_nu/lam dlam == f_nu d (ln nu)    
-        temp_flux = INTEGRATOR(filter.throughput*templ_filter/filter.wave, filter.wave) / filter_norm
+        temp_flux = INTEGRATOR(integrate_templ*integrate_weight, integrate_wave) / filter_norm
         
+        if self.err is not None:
+            temp_err = 1/np.sqrt(filter_norm)
+            
         if abmag:
-            return -2.5*np.log10(temp_flux)-48.6
+            temp_mag = -2.5*np.log10(temp_flux)-48.6
+            return temp_mag
         else:
-            return temp_flux
+            if self.err is not None:
+                return temp_flux, temp_err
+            else:
+                return temp_flux
 
 def load_templates(fwhm=400, line_complexes=True, stars=False,
                    full_line_list=None, continuum_list=None,
@@ -1572,7 +1629,7 @@ def load_templates(fwhm=400, line_complexes=True, stars=False,
                                  
     return temp_list    
 
-def load_quasar_templates(broad_fwhm=2500, narrow_fwhm=1200, broad_lines=    ['HeI-5877', 'MgII', 'Lya', 'CIV-1549', 'CIII-1908', 'OIII-1663', 'HeII-1640', 'SiIV+OIV-1398', 'NIV-1487', 'NV-1240'], narrow_lines=['OII', 'OIII', 'SII', 'OI-6302', 'NeIII-3867', 'NeVI-3426', 'NeV-3346'], include_feii=True, slopes=[-2.8, 0, 2.8], uv_line_complex=True, fixed_narrow_lines=False, t1_only=False):
+def load_quasar_templates(broad_fwhm=2500, narrow_fwhm=1200, broad_lines=    ['HeI-5877', 'MgII', 'Lya', 'CIV-1549', 'CIII-1908', 'OIII-1663', 'HeII-1640', 'SiIV+OIV-1398', 'NIV-1487', 'NV-1240'], narrow_lines=['OII', 'OIII', 'SII', 'OI-6302', 'NeIII-3867', 'NeVI-3426', 'NeV-3346'], include_feii=True, slopes=[-2.8, 0, 2.8], uv_line_complex=True, fixed_narrow_lines=False, t1_only=False, nspline=13):
     """
     Make templates suitable for fitting broad-line quasars
     """
@@ -1634,7 +1691,7 @@ def load_quasar_templates(broad_fwhm=2500, narrow_fwhm=1200, broad_lines=    ['H
 
     ### Spline continua
     cont_wave = np.arange(5000, 2.4e4)
-    bsplines = bspline_templates(cont_wave, df=13, log=True)
+    bsplines = bspline_templates(cont_wave, df=nspline, log=True)
     for key in bsplines:
         t0[key] = t1[key] = bsplines[key]
     
@@ -1644,6 +1701,24 @@ def load_quasar_templates(broad_fwhm=2500, narrow_fwhm=1200, broad_lines=    ['H
     
     return t0, t1
     
+def load_phoenix_stars():
+    """
+    Load Phoenix stellar templates
+    """
+    from collections import OrderedDict
+    
+    hdu = pyfits.open(os.path.join(GRIZLI_PATH, 'templates/stars/bt-settl_t400-3500_z0.0.fits'))
+    tab = GTable.gread(hdu[1])
+    
+    tstars = OrderedDict()
+    N = tab['flux'].shape[1]
+    for i in range(N):
+        label = 'bt-settl_t{0:05.0f}_g{1:3.1f}'.format(tab.meta['TEFF{0:03d}'.format(i)], tab.meta['LOGG{0:03d}'.format(i)])
+        tstars[label] = SpectrumTemplate(wave=tab['wave'], flux=tab['flux'][:,i], name=label)
+    
+    return tstars
+    
+        
 def load_sdss_pca_templates(file='spEigenQSO-55732.fits', smooth=3000):
     """
     Load SDSS eigen templates
@@ -1730,7 +1805,70 @@ def eval_bspline_templates(wave, bspl, coefs):
     xspl = np.log(wave)
     basis = splev(xspl, (bspl.knots, coefs, bspl.degree))
     return np.array(basis)
+
+def split_spline_template(templ, wavelength_range=[5000,2.4e4], Rspline=10, log=True):
+    """
+    Multiply a single template by spline bases to effectively generate a    
+    spline multiplicative correction that can be fit with linear least 
+    squares.
     
+    Parameters
+    ==========
+    
+    templ : `~grizli.utils.SpectrumTemplate`
+        Template to split.
+        
+    wavelength_range : [float, float]
+        Limit the splines to this wavelength range
+    
+    Rspline : float
+        Effective resolution, R=dlambda/lambda, of the spline correction 
+        function.
+    
+    log : bool
+        Log-spaced splines
+    
+    Returns
+    =======
+    
+    stemp : dict
+    
+        Dictionary of spline-component templates, with additional attributes:
+        
+            wspline = wavelength of the templates / spline correction
+            tspline = matrix of the spline corrections
+            knots   = peak wavelenghts of each spline component
+        
+    """
+    from collections import OrderedDict
+    from grizli import utils
+
+    if False:
+        stars = utils.load_templates(stars=True)
+        templ = stars['stars/L1.0.txt']    
+    
+    wspline = templ.wave
+    
+    clip = (wspline > wavelength_range[0]) & (wspline < wavelength_range[1])
+    df_spl = len(utils.log_zgrid(zr=wavelength_range, dz=1./Rspline))
+    
+    tspline = utils.bspline_templates(wspline[clip], df=df_spl+2, log=log, clip=0.0001, get_matrix=True)
+    
+    ix = np.argmax(tspline, axis=0)
+    knots = wspline[clip][ix]
+    
+    N = tspline.shape[1]
+    stemp = OrderedDict()
+    for i in range(N):
+        name='{0} {1:.2f}'.format(templ.name, knots[i]/1.e4)
+        stemp[name] = utils.SpectrumTemplate(wave=wspline[clip], flux=templ.flux[clip]*tspline[:,i], name=name)
+        stemp[name].knot = knots[i]
+    
+    stemp.wspline = wspline[clip]
+    stemp.tspline = tspline
+    stemp.knots = knots
+    
+    return stemp
 def polynomial_templates(wave, order=0, line=False):
     temp = OrderedDict()  
     if line:
@@ -1926,6 +2064,145 @@ def compute_equivalent_widths(templates, coeffs, covar, max_R=5000, Ndraw=1000, 
     
     return EWdict
 
+def get_multiple_vizier():
+    pass
+    
+PS1_VIZIER = 'II/349'
+PS1_BANDS = OrderedDict([('g_HSC', ['gKmag', 'e_gKmag']),
+                 ('r_HSC', ['rKmag', 'e_rKmag']),
+                 ('i_HSC', ['iKmag', 'e_iKmag']),
+                 ('z_HSC', ['zKmag', 'e_zKmag']),
+                 ('y_HSC', ['yKmag', 'e_yKmag'])])
+
+SDSS_VIZIER = 'V/147/sdss12'
+SDSS_BANDS = OrderedDict([('SDSS/u', ['umag', 'e_umag']),
+                          ('SDSS/g', ['gmag', 'e_gmag']),
+                          ('SDSS/r', ['rmag', 'e_rmag']),
+                          ('SDSS/i', ['imag', 'e_imag']),
+                          ('SDSS/z', ['zmag', 'e_zmag'])])
+                 
+def get_Vizier_photometry(ra, dec, templates=None, radius=2, vizier_catalog=PS1_VIZIER, bands=PS1_BANDS, filter_file='/usr/local/share/eazy-photoz/filters/FILTER.RES.latest', MW_EBV=0):
+    """
+    Fetch photometry from a Vizier catalog
+    
+    Requires eazypy/eazy
+    """
+    
+    from collections import OrderedDict
+    
+    import astropy.units as u    
+    from astroquery.vizier import Vizier
+    import astropy.coordinates as coord
+    import astropy.units as u
+    
+    #import pysynphot as S
+    
+    from eazy.templates import Template
+    from eazy.filters import FilterFile
+    from eazy.photoz import TemplateGrid
+    from eazy.filters import FilterDefinition
+    
+    res = FilterFile(filter_file)
+    
+    # PS1
+    #vizier_catalog = 'II/349'
+    # bands = 'grizy'
+    # 
+    # bands = OrderedDict()
+    # for b in 'grizy':
+    #     bands['{0}_HSC'.format(b)] = [b+'Kmag', 'e_{0}Kmag'.format(b)]
+            
+    coo = coord.SkyCoord(ra=ra, dec=dec, unit=(u.deg, u.deg),
+                         frame='icrs')
+                                                      
+    v = Vizier(catalog=vizier_catalog, columns=['+_r','*'])
+    try:
+        tab = v.query_region(coo, radius="{0}s".format(radius),
+                          catalog=vizier_catalog)[0]
+        
+        ix = np.argmin(tab['_r'])
+        tab = tab[ix]
+    except:
+        tab = None
+        
+        return None
+    
+    filters = [res.filters[res.search(b, verbose=False)[0]] for b in bands]
+                      
+    pivot = OrderedDict()
+    for ib, b in enumerate(bands):
+        pivot[b] = filters[ib].pivot()
+        
+    to_flam = 10**(-0.4*(48.6))*3.e18 # / pivot(Ang)**2
+    
+    flam = []
+    eflam = []
+    for b in bands:
+        fcol, ecol = bands[b]
+        flam.append(10**(-0.4*(tab[fcol]))*to_flam/pivot[b]**2)
+        eflam.append(tab[ecol]*np.log(10)/2.5*flam[-1])
+    
+    lc = [pivot[b] for b in bands]
+     
+    for i in range(len(filters))[::-1]:
+        if not np.isscalar(flam[i]):
+            flam.pop(i)
+            eflam.pop(i)
+            filters.pop(i)
+            lc.pop(i)
+    
+    #
+    if templates is not None:
+        twave, tflux, is_line = array_templates(templates, z=0)
+        eazy_templates = []
+        for i, t in enumerate(templates):
+            eazy_templates.append(Template(arrays=[twave, np.maximum(twave, 1.e-30)], name=t))
+            
+        zgrid = log_zgrid(zr=[0.01, 3.4], dz=0.005)
+    
+        tempfilt = TemplateGrid(zgrid, eazy_templates, filters=filters, add_igm=True, galactic_ebv=MW_EBV, Eb=0, n_proc=0, verbose=False)
+    else:
+        tempfilt = None
+            
+    phot = OrderedDict([('flam', np.array(flam)), ('eflam', np.array(eflam)), ('filters', filters), ('tempfilt',tempfilt), ('lc',np.array(lc))])
+    
+    return phot
+
+def generate_tempfilt(templates, filters, zgrid=None, MW_EBV=0):
+    
+    from eazy.templates import Template
+    from eazy.photoz import TemplateGrid
+    
+    twave, tflux, is_line = array_templates(templates, z=0)
+    eazy_templates = []
+    for i, t in enumerate(templates):
+        eazy_templates.append(Template(arrays=[twave, np.maximum(twave, 1.e-30)], name=t))
+        
+    if zgrid is None:
+        zgrid = log_zgrid(zr=[0.01, 3.4], dz=0.005)
+
+    tempfilt = TemplateGrid(zgrid, eazy_templates, filters=filters, add_igm=True, galactic_ebv=MW_EBV, Eb=0, n_proc=0, verbose=False)
+    
+    return tempfilt
+    
+def combine_phot_dict(phots, templates=None, MW_EBV=0):
+    """
+    Combine photmetry dictionaries
+    """
+    phot = {}
+    phot['flam'] = []
+    phot['eflam'] = []
+    phot['filters'] = []
+    for p in phots:
+        phot['flam'] = np.append(phot['flam'], p['flam'])
+        phot['eflam'] = np.append(phot['eflam'], p['eflam'])
+        phot['filters'].extend(p['filters'])
+    
+    if templates is not None:
+        phot['tempfilt'] = generate_tempfilt(templates, phot['filters'], MW_EBV=MW_EBV)
+        
+    return phot
+    
 def get_spectrum_AB_mags(spectrum, bandpasses=[]):
     """
     Integrate a `~pysynphot` spectrum through filter bandpasses
@@ -2913,6 +3190,19 @@ class EffectivePSF(object):
             data[data < 0] = 0 
             
             self.epsf[filter] = data
+        
+        # ACS
+        for filter in ['F606W', 'F814W']:
+            file = os.path.join(GRIZLI_PATH, 'CONF',
+                                'PSFSTD_ACSWFC_{0}.fits'.format(filter))
+            
+            if not os.path.exists(file):
+                continue
+            
+            data = pyfits.open(file, ignore_missing_end=True)[0].data.T
+            data[data < 0] = 0 
+            
+            self.epsf[filter] = data
             
         # Dummy, use F105W ePSF for F098M and F110W
         self.epsf['F098M'] = self.epsf['F105W']
@@ -2979,26 +3269,35 @@ class EffectivePSF(object):
             psf_xy += fx*fy*epsf[:, :, (nx+1)+(ny+1)*3]
             self.eval_filter = filter
         else:
-            # UVIS
-            rx = 1+(np.clip(x,1,4095)-0)/(4096/(7-1))
-            ry = 1+(np.clip(y,1,4095)-0)/(4096/(8-1))
+            
+            sh = epsf.shape
+            
+            if sh[2] == 90:
+                # ACS WFC
+                iX, iY = 9, 10
+            else:
+                # UVIS
+                iX, iY = 7, 8
+                
+            rx = 1+(np.clip(x,1,4095)-0)/(4096/(iX-1))
+            ry = 1+(np.clip(y,1,4095)-0)/(4096/(iY-1))
                 
             # zero index
             rx -= 1
             ry -= 1 
 
-            nx = np.clip(np.cast[int](rx), 0, 6)
-            ny = np.clip(np.cast[int](ry), 0, 7)
+            nx = np.clip(np.cast[int](rx), 0, iX-1)
+            ny = np.clip(np.cast[int](ry), 0, iY-1)
 
             # print x, y, rx, ry, nx, ny
 
             fx = rx-nx
             fy = ry-ny
 
-            psf_xy = (1-fx)*(1-fy)*epsf[:, :, nx+ny*7]
-            psf_xy += fx*(1-fy)*epsf[:, :, (nx+1)+ny*7]
-            psf_xy += (1-fx)*fy*epsf[:, :, nx+(ny+1)*7]
-            psf_xy += fx*fy*epsf[:, :, (nx+1)+(ny+1)*7]
+            psf_xy = (1-fx)*(1-fy)*epsf[:, :, nx+ny*iY]
+            psf_xy += fx*(1-fy)*epsf[:, :, (nx+1)+ny*iY]
+            psf_xy += (1-fx)*fy*epsf[:, :, nx+(ny+1)*iY]
+            psf_xy += fx*fy*epsf[:, :, (nx+1)+(ny+1)*iY]
 
             self.eval_filter = filter
             
@@ -3183,7 +3482,10 @@ class EffectivePSF(object):
         ivar_mask *= ivar
         
         if get_extended:
-            extended_data = self.extended_epsf[filter]
+            if filter in self.extended_epsf:
+                extended_data = self.extended_epsf[filter]
+            else:
+                extended_data = None
         else:
             extended_data = None
         
@@ -3268,7 +3570,10 @@ class EffectivePSF(object):
             dy = yp-psf_params[2]-y0
         
         if get_extended:
-            extended_data = self.extended_epsf[filter]
+            if filter in self.extended_epsf:
+                extended_data = self.extended_epsf[filter]
+            else:
+                extended_data = None
         else:
             extended_data = None
         
